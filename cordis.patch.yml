@@ -1,0 +1,5 @@
+# dsh-cross-model-bridge bundle patch
+- insert:
+    - id: cross-model-bridge
+      name: 'dsh-cross-model-bridge'
+      config: {}
