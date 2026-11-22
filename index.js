@@ -31,10 +31,6 @@
  *   @earendil-works/pi-ai dist/api/openai-completions.js（无签名思考被丢弃）。
  */
 
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-
 export const name = 'dsh-cross-model-bridge';
 export const inject = ['llm'];
 
