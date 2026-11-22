@@ -1,6 +1,6 @@
 {
   "name": "dsh-cross-model-bridge",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "DSH 跨模型思考桥：切换模型时把上一模型的 reasoning 块降级为正文文本标签，避免思考被静默丢弃，保持推演接力；含滑动窗口与共享记忆注入。",
   "type": "module",
   "license": "MIT",

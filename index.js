@@ -48,10 +48,14 @@ const DEFAULT_CONFIG = {
 const LABEL = {
   zh: {
     head: (model) => `【前序模型 ${model || '未知模型'} 的推演思路（供接续参考）】`,
+    // 防模仿提示：pi-ai 官方为避免模型复述注入格式，特意用无标签纯文本；
+    // 这里保留显式标签以传达"这是前序思考"的信号，但附加不复述指令。
+    note: '（以下为系统注入的历史上下文，仅供接续参考；请在回答中直接使用其结论，不要复述本标签或本段格式。）',
     truncated: '……[思考过长已截断]',
   },
   en: {
     head: (model) => `[Previous model ${model || 'unknown'} reasoning (for continuity)]`,
+    note: '(System-injected historical context for reference only; use its conclusions directly and do not repeat this label or its format in your reply.)',
     truncated: '...[reasoning truncated]',
   },
 };
@@ -124,7 +128,8 @@ function bridgeContent(message, targetProvider, targetModel, allowed, config, la
   if (joined.length > config.maxThinkingLength) {
     joined = joined.slice(0, config.maxThinkingLength) + '\n' + label.truncated;
   }
-  const tag = `\n${label.head(sourceModelOf(message))}\n${joined}\n\n`;
+  const note = label.note ? `\n${label.note}` : '';
+  const tag = `\n${label.head(sourceModelOf(message))}${note}\n${joined}\n\n`;
   return [{ type: 'text', text: tag }, ...rest];
 }
 
