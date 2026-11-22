@@ -29,6 +29,7 @@
     "index.js",
     "cordis.patch.yml",
     "README.md",
-    "package.json"
+    "package.json",
+    "LICENSE"
   ]
 }
