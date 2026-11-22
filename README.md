@@ -12,6 +12,22 @@ DSH（DeepSeek Harness）跨模型思考桥：在同一个会话里切换模型�
   pi-ai（千问 openai-completions）则**静默丢弃**无签名思考——新模型什么都看不到。
 - 本插件在宿主层把跨模型思考降级为正文文本，推演接力不断线。
 
+## 跨模型的判定规则
+
+replay 是否有效取决于 **adapter 实例**，而 adapter 按 **provider 路由**注册
+（LlmRuntime 只在该 adapter 同时拥有历史 provider 与目标 provider 时才暴露
+replayState）。因此本插件把「provider 或 model 任一不同」都判定为跨模型：
+
+| 历史来源 | 目标 | 判定 | 处理 |
+|---|---|---|---|
+| provider A / model X | provider A / model X | 同路由 | 完全不动（保住原生签名 replay） |
+| provider A / model X | provider B / model X | **跨模型** | 转写为正文标签 |
+| provider A / model X | provider A / model Y | **跨模型** | 转写为正文标签 |
+| 无 source 信息 | 任意 | 保守 | 完全不动 |
+
+> 只比较 model 会把「同名模型、不同 provider」误判为同模型，导致思考被适配器
+> 静默丢弃——这是 1.0.0 的缺陷，1.0.1 已修复。
+
 ## 工作原理（全部走官方公开扩展点）
 
 1. 监听 Cordis 瀑布事件 `'llm/stream'`；
@@ -28,7 +44,7 @@ DSH（DeepSeek Harness）跨模型思考桥：在同一个会话里切换模型�
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | enabled | true | 总开关 |
-| keepThinkingTurns | 1 | 为最近 N 条跨模型 assistant 消息注入思考文本 |
+| keepThinkingTurns | 1 | 为最近 N 条跨模型 assistant 消息注入思考文本；设为 `0` 表示完全不注入（仅剔除 reasoning 块，最省 Token） |
 | maxThinkingLength | 3000 | 单条注入的最大字符数 |
 | lang | zh | 标签语言（zh/en） |
 

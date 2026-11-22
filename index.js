@@ -75,21 +75,35 @@ function reasoningTextsOf(message) {
   return texts.length > 0 ? texts : null;
 }
 
-/** assistant 消息 source 里记录的产生模型（跨模型判断依据）。 */
-function sourceModelOf(message) {
+/** assistant 消息 source 里记录的产生路由（provider + model）。 */
+function sourceRouteOf(message) {
   const src = message && message.source;
   if (!src || src.kind !== 'model') return undefined;
-  return typeof src.model === 'string' ? src.model : undefined;
+  return {
+    provider: typeof src.provider === 'string' ? src.provider : undefined,
+    model: typeof src.model === 'string' ? src.model : undefined,
+  };
+}
+
+/** 用于标签显示的产生模型名。 */
+function sourceModelOf(message) {
+  const route = sourceRouteOf(message);
+  return route === undefined ? undefined : route.model;
 }
 
 /**
- * 判断一条 assistant 消息的思考是否"跨模型"：产生模型与本次请求目标不同。
- * 同模型（含同名不同 provider 由上层 replay 校验兜底）则不动，保住原生签名回放。
+ * 判断一条 assistant 消息的思考是否"跨模型/跨路由"。
+ *
+ * 关键：replay 的有效性由 adapter 实例决定，而 adapter 按 provider 路由注册
+ * （LlmRuntime 只在该 adapter 同时拥有历史 provider 与目标 provider 时才暴露
+ * replayState）。因此 provider 或 model 任一不同都必须视为跨模型——
+ * 只比较 model 会把"同名模型、不同 provider"误判为同模型，导致思考被静默丢弃。
  */
-function isCrossModel(message, targetModel) {
-  const from = sourceModelOf(message);
+function isCrossModel(message, targetProvider, targetModel) {
+  const from = sourceRouteOf(message);
   if (from === undefined) return false; // 拿不到来源就保守地不动
-  return from !== targetModel;
+  if (from.provider !== undefined && targetProvider !== undefined && from.provider !== targetProvider) return true;
+  return from.model !== targetModel;
 }
 
 /**
@@ -97,20 +111,17 @@ function isCrossModel(message, targetModel) {
  * 保留非 reasoning 块原样（含 tool-call，保证工具契约），把（允许保留的）
  * 跨模型思考以文本标签形式放在最前，剔除 reasoning 块本身。
  */
-function bridgeContent(message, targetModel, allowed, config, label) {
+function bridgeContent(message, targetProvider, targetModel, allowed, config, label) {
   const texts = reasoningTextsOf(message);
   if (texts === null) return null; // 没有思考块，无需改写
 
-  const keep = allowed && isCrossModel(message, targetModel);
+  if (!isCrossModel(message, targetProvider, targetModel)) return null; // 同模型/同路由：完全不动，保住原生 replay
+
   const rest = message.content.filter((b) => !(b && b.type === 'reasoning'));
 
-  if (!keep) {
-    // 不注入文本时也必须剔除 reasoning 块吗？——不需要：同模型走 replay，
-    // 适配器自己会带签名回放。跨模型但超出滑动窗口时，剔除块本身可省 Token，
-    // 且反正适配器也会丢弃/降级它。这里选择剔除，行为可预期。
-    const cross = isCrossModel(message, targetModel);
-    if (!cross) return null; // 同模型：完全不动
-    return rest; // 跨模型但不在窗口内：仅剔除 reasoning 块
+  if (!allowed) {
+    // 跨模型但超出滑动窗口：只剔除 reasoning 块（适配器本来也会丢弃），不注入文本省 Token
+    return rest;
   }
 
   let joined = texts.join('\n\n');
@@ -138,20 +149,24 @@ function cloneOptions(options) {
  *   更早的跨模型思考直接剔除（适配器本来也会丢）；
  * 4. 其余角色与块（user/system/tool/文本/图片/tool-call）一律原样保留。
  */
-function transformMessages(messages, targetModel, config, label) {
+function transformMessages(messages, targetProvider, targetModel, config, label) {
   // 收集"含跨模型思考"的 assistant 消息下标
   const crossIndices = [];
   messages.forEach((m, i) => {
-    if (reasoningTextsOf(m) && isCrossModel(m, targetModel)) crossIndices.push(i);
+    if (reasoningTextsOf(m) && isCrossModel(m, targetProvider, targetModel)) crossIndices.push(i);
   });
   if (crossIndices.length === 0) return null;
 
-  const allowed = new Set(crossIndices.slice(-config.keepThinkingTurns));
+  // 注意：keepThinkingTurns 为 0 时 slice(-0) === slice(0) 会返回全部，
+  // 因此必须显式判 0（表示保留 0 条）。负数按 0 处理。
+  const raw = Number(config.keepThinkingTurns);
+  const keepCount = Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 1;
+  const allowed = new Set(keepCount === 0 ? [] : crossIndices.slice(-keepCount));
 
   let changed = false;
   const out = messages.map((m, i) => {
     if (m.role !== 'assistant') return m;
-    const next = bridgeContent(m, targetModel, allowed.has(i), config, label);
+    const next = bridgeContent(m, targetProvider, targetModel, allowed.has(i), config, label);
     if (next === null) return m;
     changed = true;
     return { ...m, content: next };
@@ -168,17 +183,17 @@ export function apply(ctx, userConfig = {}) {
     if (!config.enabled || !options || !Array.isArray(options.messages)) return next();
     if (HANDLED.has(options)) return next(); // 自己重入的克隆：直通放行
 
-    let targetModel;
     try {
-      targetModel = options.model;
-      const nextMessages = transformMessages(options.messages, targetModel, config, label);
+      const targetProvider = options.provider;
+      const targetModel = options.model;
+      const nextMessages = transformMessages(options.messages, targetProvider, targetModel, config, label);
       if (nextMessages === null) return next();
 
       const clone = cloneOptions(options);
       clone.messages = nextMessages;
       HANDLED.add(clone);
       ctx.logger.info(
-        `cross-model-bridge: rewrote ${options.messages.length} -> ${nextMessages.length} messages for target ${options.provider}/${String(targetModel)}`,
+        `cross-model-bridge: rewrote ${options.messages.length} -> ${nextMessages.length} messages for target ${String(targetProvider)}/${String(targetModel)}`,
       );
       // 重新进入瀑布：从外层链干净地走一遍（含其他监听者与适配器选择）
       return ctx.llm.stream(clone);
