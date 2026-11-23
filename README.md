@@ -1,12 +1,13 @@
 # dsh-cross-model-bridge
 
-[![version](https://img.shields.io/badge/version-1.0.2-blue)](https://github.com/ZhangJinHui0627/dsh-cross-model-bridge)
+[![version](https://img.shields.io/badge/version-1.2.0-blue)](https://github.com/ZhangJinHui0627/dsh-cross-model-bridge/releases)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![platform](https://img.shields.io/badge/platform-Windows-lightgrey)](#安装--卸载)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20DSH%20Desktop-lightgrey)](#安装--卸载)
 
 **DSH（DeepSeek Harness）跨模型思考桥**：在同一个会话里切换模型时，把上一模型的
 思考（reasoning 块）转写为正文文本标签，让新模型能读到上一模型的推演思路；
-同时剔除注定被适配器丢弃的跨模型 reasoning 块——行为可预期、Token 可控。
+同时剔除注定被适配器丢弃的跨模型 reasoning 块——行为可预期、Token 可控、
+并提供**按会话隔离的可视化桥接记录面板**。
 
 ```text
 模型 A 深度推理 ──切模型──▶ 模型 B 接续回答
@@ -15,6 +16,16 @@
         被适配器静默丢弃）      插件转写为正文标签,
                                B 看得到 A 的完整思路
 ```
+
+## 特性总览
+
+- 🔁 **推演接力**：跨模型切换时，上一模型的思考自动降级为正文标签，新模型零丢失接续；
+- 🛡️ **防 400 崩溃**：剥离各家私有思考字段与失效签名，跨厂商切换不再报非法请求；
+- 🪟 **滑动窗口**：只注入最近 N 轮思考（默认 1），超长思考硬截断，Token 可控；
+- 📊 **可视化面板**：DSH 右侧栏 + 会话主视图双入口，实时查看每次桥接的方向与规模；
+- 💾 **本地持久化**：桥接记录落盘 JSON（FIFO 上限 500 条），重启不丢、不膨胀、不上传；
+- 🧩 **按会话隔离**：每个对话只显示自己的桥接记录，互不混杂；
+- ⚡ **纯本地执行**：零 AI 调用、零额外 Token、亚毫秒级延迟、数据不出本机。
 
 ## 为什么需要它
 
@@ -49,13 +60,25 @@ replayState）。因此本插件把「provider 或 model 任一不同」都判�
 
 ## 工作原理（全部走官方公开扩展点，无猴子补丁）
 
+**宿主半（`index.js`）**：
+
 1. 监听 Cordis 瀑布事件 `'llm/stream'`（同官方 `dsh-session-checkpoint-policy` 的模式）；
 2. 检测消息里是否存在"来源路由 ≠ 目标路由"的 reasoning 块；**没有则零开销直通**；
 3. 有则克隆请求（保留 live 的 `AbortSignal`）：
    - 最近 `keepThinkingTurns` 条跨模型思考 → 转写为正文开头的文本标签；
    - 更早的跨模型思考 → 仅剔除 reasoning 块（适配器本来也会丢弃）；
    - 其余消息与块（tool-call、image、text）→ 原样保留；
-4. 用 `ctx.llm.stream(clone)` 重新进入瀑布；WeakSet 标记防递归。
+4. 用 `ctx.llm.stream(clone)` 重新进入瀑布；WeakSet 标记防递归；
+5. 每次桥接写入内存环形缓冲（200 条）并防抖持久化到本地
+   `.bridge-events.json`（FIFO 上限 500 条，仅元数据：时间、路由、字数，不含消息内容）；
+6. 通过 `GET /plugins/dsh-cross-model-bridge/events` 供页面拉取，支持 `?sessionId=` 过滤。
+
+**浏览器半（`client.js`）**：
+
+1. 注册右侧栏 tab 类型 + 会话主视图（`sidebarRightTabs` / `conversation.view`）双入口；
+2. 页面含吸顶状态卡（版本/开关/窗口/上限）、一键回顶、自动刷新；
+3. 默认只显示**当前会话**的桥接记录，可一键切换"全部对话"；
+4. 重启或刷新 DSH 后记录从本地文件恢复，不丢失。
 
 注入的标签自带"请勿复述本标签"的防模仿提示（pi-ai 官方为此特意使用无标签
 纯文本；本插件保留显式标签以传达"前序思考"信号，附加不复述指令折中）。
@@ -81,6 +104,18 @@ replayState）。因此本插件把「provider 或 model 任一不同」都判�
 | `maxThinkingLength` | `3000` | 单条注入的最大字符数，超出截断 |
 | `lang` | `zh` | 标签语言（`zh` / `en`） |
 
+## 资源与数据保存策略
+
+| 数据 | 保存位置 | 上限 | 生命周期 |
+|---|---|---|---|
+| 桥接事件（页面展示） | 内存环形缓冲 | 200 条 | DSH 进程存活期间 |
+| 桥接事件（持久化） | `$DSH_HOME/dsh-cross-model-bridge/.bridge-events.json` | 500 条（FIFO） | 永久保留，直至被新记录挤出 |
+| 原生会话消息 | DSH 自有存储 | — | 插件**零写入、零污染** |
+
+- 持久化文件只存**元数据**（时间、路由名、消息数、注入字数），不含任何对话正文；
+- 500 条上限下文件体积约 **50~80 KB**，无膨胀风险，重启后自动恢复；
+- 不想落盘可直接删除该文件，插件下次启动会重建。
+
 ## 安装 / 卸载
 
 在插件目录下执行：
@@ -93,23 +128,36 @@ pwsh -File install-profile.ps1 -Uninstall   # 卸载
 脚本做的事：备份 profile 的 `package.json` → 加 `link:` 依赖 → 追加 `dsh.profile.bundles`
 → 建 junction 链接 → 写回前校验。装完**完全退出并重开** DSH Desktop 生效。
 
-## 验证方法
+## 使用与验证
 
 1. 用模型 A（如 `deepseek-v4.1-flash`）问一个需要推理的问题；
 2. 同一会话切到另一个模型（如 `qwen3.8-max` 或 Claude）追问"我上一个问题你是怎么分析的？"；
 3. 预期：新模型能复述 A 的推理思路，且消息正文开头带注入标签；
-   GUI devtools 控制台出现 `cross-model-bridge: rewrote ...` 日志。
+4. 打开右侧栏或顶部"跨模型桥"页面：能看到这次桥接的时间、方向（如
+   `← qianwen / deepseek-v4.1 → antigravity / gemini-3.8-flash`）与注入字数；
+   重启 DSH 后记录仍在。
 
 ## 项目结构
 
 ```text
-├── index.js            # 宿主半：llm/stream 瀑布监听 + 消息变换（全部逻辑在此）
+├── index.js            # 宿主半：llm/stream 瀑布监听 + 消息变换 + 事件持久化 + 数据路由
+├── client.js           # 浏览器半：右侧栏/主视图双入口面板（无构建步骤的 ModuleLoader 包）
 ├── cordis.patch.yml    # bundle patch 声明
 ├── install-profile.ps1 # 安装/卸载脚本（改写自 dsh-codex-effort-slider）
 ├── install.cmd         # Windows 双击入口（自动选择 pwsh/powershell）
-├── package.json
-└── README.md
+├── package.json        # 含 dsh.client 声明（platform: web）
+├── README.md
+└── LICENSE
 ```
+
+## 版本历史
+
+| 版本 | 要点 |
+|---|---|
+| 1.2.0 | 可视化桥接面板（右栏 + 主视图）、按会话隔离、本地持久化（500 条 FIFO）、防丢恢复 |
+| 1.0.2 | 注入标签增加"请勿复述"防模仿提示 |
+| 1.0.1 | 跨模型判定改为 provider + model 双比较（修复同名模型跨 provider 静默丢思考） |
+| 1.0.0 | 首版：llm/stream 拦截、思考转写、滑动窗口、Token 截断 |
 
 ## 开源参考与致谢
 
@@ -117,6 +165,7 @@ pwsh -File install-profile.ps1 -Uninstall   # 卸载
 |---|---|---|
 | `'llm/stream'` 瀑布监听模式 | [@deepseek-ai/dsh-session-checkpoint-policy](https://github.com/deepseek-ai)、dsh-session-title | MIT |
 | 消息/块词汇表、冻结语义、`markAgentLoopRequest` | [@deepseek-ai/dsh-llm](https://github.com/deepseek-ai) | MIT |
+| 右侧栏 tab 类型公开注册路径 | `dsh-client-ui-sidebar-right`、`dsh-client-ui-sidebar-documentpreview` | MIT |
 | 适配器跨模型思考降级行为的判定依据 | `dsh-llm-deepseek`、[@earendil-works/pi-ai](https://www.npmjs.com/package/@earendil-works/pi-ai) | MIT |
 | 安装脚本 | dsh-codex-effort-slider `install-profile.ps1` | — |
 
