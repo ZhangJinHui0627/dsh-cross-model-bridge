@@ -1,4 +1,7 @@
 node_modules/
+# 插件运行时数据(本地桥接事件持久化,不进仓库)
+.bridge-events.json
+
 *.log
 .DS_Store
 Thumbs.db

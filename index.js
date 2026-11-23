@@ -22,14 +22,14 @@
  *   用模块级 WeakSet 标记克隆对象防止无限递归。
  * - 仅当请求里确实存在"跨模型思考"时才克隆重入；否则原样 next() 直通，
  *   零开销。同模型请求（replay 有效）完全不动。
- *
- * 参考致谢：
- * - 'llm/stream' 瀑布监听模式：@deepseek-ai/dsh-session-checkpoint-policy (MIT)
- * - 消息/块词汇表与冻结语义：@deepseek-ai/dsh-llm (MIT) src/index.ts JSDoc
- * - 适配器对跨模型思考的降级行为依据：@deepseek-ai/dsh-llm-deepseek
- *   lib serialize assistant()（无签名时发裸 thinking 块）与
- *   @earendil-works/pi-ai dist/api/openai-completions.js（无签名思考被丢弃）。
  */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const STORAGE_FILE = path.join(__dirname, '.bridge-events.json');
 
 export const name = 'dsh-cross-model-bridge';
 export const inject = ['llm'];
@@ -48,8 +48,6 @@ const DEFAULT_CONFIG = {
 const LABEL = {
   zh: {
     head: (model) => `【前序模型 ${model || '未知模型'} 的推演思路（供接续参考）】`,
-    // 防模仿提示：pi-ai 官方为避免模型复述注入格式，特意用无标签纯文本；
-    // 这里保留显式标签以传达"这是前序思考"的信号，但附加不复述指令。
     note: '（以下为系统注入的历史上下文，仅供接续参考；请在回答中直接使用其结论，不要复述本标签或本段格式。）',
     truncated: '……[思考过长已截断]',
   },
@@ -62,6 +60,46 @@ const LABEL = {
 
 // 标记"本插件已处理的克隆请求"，防止重入循环
 const HANDLED = new WeakSet();
+
+// ── 桥接事件记录器：支持按 Session 隔离与本地轻量防丢持久化 ──
+const MAX_EVENTS = 500;
+
+function createEventLog() {
+  let events = [];
+  try {
+    if (fs.existsSync(STORAGE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
+      if (Array.isArray(data)) {
+        events = data.slice(-MAX_EVENTS);
+      }
+    }
+  } catch (err) {
+    // 忽略损坏的持久化文件
+  }
+
+  let saveTimer = null;
+  function persist() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      try {
+        fs.writeFileSync(STORAGE_FILE, JSON.stringify(events, null, 2), 'utf8');
+      } catch (err) {
+        // 忽略写入失败
+      }
+    }, 500);
+  }
+
+  return {
+    push(event) {
+      events.push(event);
+      if (events.length > MAX_EVENTS) events.splice(0, events.length - MAX_EVENTS);
+      persist();
+    },
+    list() { return [...events]; },
+    get size() { return events.length; },
+  };
+}
 
 /** 取出 assistant 消息里所有 reasoning 块文本；无则返回 null。 */
 function reasoningTextsOf(message) {
@@ -93,114 +131,212 @@ function sourceModelOf(message) {
 
 /**
  * 判断一条 assistant 消息的思考是否"跨模型/跨路由"。
- *
- * 关键：replay 的有效性由 adapter 实例决定，而 adapter 按 provider 路由注册
- * （LlmRuntime 只在该 adapter 同时拥有历史 provider 与目标 provider 时才暴露
- * replayState）。因此 provider 或 model 任一不同都必须视为跨模型——
- * 只比较 model 会把"同名模型、不同 provider"误判为同模型，导致思考被静默丢弃。
  */
 function isCrossModel(message, targetProvider, targetModel) {
   const from = sourceRouteOf(message);
-  if (from === undefined) return false; // 拿不到来源就保守地不动
+  if (from === undefined) return false;
   if (from.provider !== undefined && targetProvider !== undefined && from.provider !== targetProvider) return true;
   return from.model !== targetModel;
 }
 
-/**
- * 构建转写后的 assistant content：
- * 保留非 reasoning 块原样（含 tool-call，保证工具契约），把（允许保留的）
- * 跨模型思考以文本标签形式放在最前，剔除 reasoning 块本身。
- */
+/** 把一条 assistant 消息改写为"无 reasoning 块、正文前附带思考文本标签"。 */
 function bridgeContent(message, targetProvider, targetModel, allowed, config, label) {
-  const texts = reasoningTextsOf(message);
-  if (texts === null) return null; // 没有思考块，无需改写
+  const reasoningTexts = reasoningTextsOf(message);
+  const cross = isCrossModel(message, targetProvider, targetModel);
 
-  if (!isCrossModel(message, targetProvider, targetModel)) return null; // 同模型/同路由：完全不动，保住原生 replay
+  const nonReasoning = (message.content || []).filter(
+    (b) => !b || b.type !== 'reasoning',
+  );
 
-  const rest = message.content.filter((b) => !(b && b.type === 'reasoning'));
-
-  if (!allowed) {
-    // 跨模型但超出滑动窗口：只剔除 reasoning 块（适配器本来也会丢弃），不注入文本省 Token
-    return rest;
+  if (!cross || !reasoningTexts || !allowed) {
+    return {
+      content: nonReasoning.length > 0 ? nonReasoning : [{ type: 'text', text: '' }],
+      bridged: false,
+      stripped: cross && Boolean(reasoningTexts),
+      injectedChars: 0,
+    };
   }
 
-  let joined = texts.join('\n\n');
-  if (joined.length > config.maxThinkingLength) {
-    joined = joined.slice(0, config.maxThinkingLength) + '\n' + label.truncated;
+  const modelName = sourceModelOf(message);
+  let raw = reasoningTexts.join('\n\n');
+  let truncated = false;
+  if (raw.length > config.maxThinkingLength) {
+    raw = raw.slice(0, config.maxThinkingLength);
+    truncated = true;
   }
-  const note = label.note ? `\n${label.note}` : '';
-  const tag = `\n${label.head(sourceModelOf(message))}${note}\n${joined}\n\n`;
-  return [{ type: 'text', text: tag }, ...rest];
+
+  const quoted = raw
+    .split('\n')
+    .map((line) => `> ${line}`)
+    .join('\n');
+
+  const injected = [
+    label.head(modelName),
+    quoted,
+    ...(truncated ? [`> ${label.truncated}`] : []),
+    label.note,
+    '',
+  ].join('\n');
+
+  const textBlock = { type: 'text', text: injected };
+  return {
+    content: [textBlock, ...nonReasoning],
+    bridged: true,
+    stripped: false,
+    injectedChars: injected.length,
+  };
 }
 
-/** 深克隆 options，保留 live 的 signal 引用（不 structuredClone 它）。 */
 function cloneOptions(options) {
-  const { signal, ...rest } = options;
-  const clone = structuredClone(rest);
-  if (signal !== undefined) clone.signal = signal;
+  const clone = { ...options };
+  if (options.tools) clone.tools = [...options.tools];
+  if (options.stop) clone.stop = [...options.stop];
+  if (options.metadata) clone.metadata = { ...options.metadata };
   return clone;
 }
 
-/**
- * 主变换：返回改写后的 messages 数组，或 null 表示无需改写。
- * 规则：
- * 1. 只处理 assistant 消息里的 reasoning 块；
- * 2. 同模型历史不动（保住原生 replay 签名路径）；
- * 3. 跨模型思考：最近 keepThinkingTurns 条转写为正文文本标签；
- *   更早的跨模型思考直接剔除（适配器本来也会丢）；
- * 4. 其余角色与块（user/system/tool/文本/图片/tool-call）一律原样保留。
- */
 function transformMessages(messages, targetProvider, targetModel, config, label) {
-  // 收集"含跨模型思考"的 assistant 消息下标
-  const crossIndices = [];
-  messages.forEach((m, i) => {
-    if (reasoningTextsOf(m) && isCrossModel(m, targetProvider, targetModel)) crossIndices.push(i);
+  const candidates = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.role === 'assistant' && isCrossModel(m, targetProvider, targetModel) && reasoningTextsOf(m)) {
+      candidates.push(i);
+    }
+  }
+
+  const allowedIndices = new Set(candidates.slice(0, config.keepThinkingTurns));
+
+  let injectedMessages = 0;
+  let strippedMessages = 0;
+  let injectedChars = 0;
+  const sources = new Set();
+
+  const nextMessages = messages.map((m, idx) => {
+    if (!m || m.role !== 'assistant') return m;
+    const allowed = allowedIndices.has(idx);
+    const { content, bridged, stripped, injectedChars: chars } = bridgeContent(
+      m,
+      targetProvider,
+      targetModel,
+      allowed,
+      config,
+      label,
+    );
+    if (bridged) {
+      injectedMessages++;
+      injectedChars += chars;
+      const r = sourceRouteOf(m);
+      if (r) sources.add(`${r.provider || '?'} / ${r.model || '?'}`);
+    }
+    if (stripped) strippedMessages++;
+
+    const copy = { ...m, content };
+    if ('thinkingSignature' in copy) delete copy.thinkingSignature;
+    return copy;
   });
-  if (crossIndices.length === 0) return null;
 
-  // 注意：keepThinkingTurns 为 0 时 slice(-0) === slice(0) 会返回全部，
-  // 因此必须显式判 0（表示保留 0 条）。负数按 0 处理。
-  const raw = Number(config.keepThinkingTurns);
-  const keepCount = Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 1;
-  const allowed = new Set(keepCount === 0 ? [] : crossIndices.slice(-keepCount));
-
-  let changed = false;
-  const out = messages.map((m, i) => {
-    if (m.role !== 'assistant') return m;
-    const next = bridgeContent(m, targetProvider, targetModel, allowed.has(i), config, label);
-    if (next === null) return m;
-    changed = true;
-    return { ...m, content: next };
-  });
-
-  return changed ? out : null;
+  return {
+    messages: nextMessages,
+    stats: { injectedMessages, strippedMessages, injectedChars, sources },
+  };
 }
 
 export function apply(ctx, userConfig = {}) {
   const config = { ...DEFAULT_CONFIG, ...userConfig };
-  const label = LABEL[config.lang] ?? LABEL.zh;
+  const label = LABEL[config.lang] || LABEL.zh;
+  const events = createEventLog();
 
   ctx.on('llm/stream', (options, next) => {
-    if (!config.enabled || !options || !Array.isArray(options.messages)) return next();
-    if (HANDLED.has(options)) return next(); // 自己重入的克隆：直通放行
+    if (!config.enabled) return next();
+    if (!options || !Array.isArray(options.messages)) return next();
+    if (HANDLED.has(options)) return next();
+
+    const targetProvider = options.provider;
+    const targetModel = options.model;
+
+    const hasCrossReasoning = options.messages.some(
+      (m) => m && m.role === 'assistant' && isCrossModel(m, targetProvider, targetModel) && reasoningTextsOf(m),
+    );
+    if (!hasCrossReasoning) return next();
 
     try {
-      const targetProvider = options.provider;
-      const targetModel = options.model;
-      const nextMessages = transformMessages(options.messages, targetProvider, targetModel, config, label);
-      if (nextMessages === null) return next();
+      const { messages: nextMessages, stats } = transformMessages(
+        options.messages,
+        targetProvider,
+        targetModel,
+        config,
+        label,
+      );
+
+      // 记录桥接事件（含会话 sessionId，支持按对话隔离）
+      events.push({
+        time: new Date().toISOString(),
+        sessionId: typeof options.sessionId === 'string' ? options.sessionId : null,
+        target: `${String(targetProvider)} / ${String(targetModel)}`,
+        sources: [...stats.sources],
+        messages: options.messages.length,
+        injectedMessages: stats.injectedMessages,
+        strippedMessages: stats.strippedMessages,
+        injectedChars: stats.injectedChars,
+        tag: label.head([...stats.sources][0]?.split(' / ').pop()),
+      });
 
       const clone = cloneOptions(options);
       clone.messages = nextMessages;
       HANDLED.add(clone);
       ctx.logger.info(
-        `cross-model-bridge: rewrote ${options.messages.length} -> ${nextMessages.length} messages for target ${String(targetProvider)}/${String(targetModel)}`,
+        `cross-model-bridge: rewrote ${options.messages.length} -> ${nextMessages.length} messages for target ${String(targetProvider)}/${String(targetModel)} (session: ${options.sessionId || 'none'})`,
       );
-      // 重新进入瀑布：从外层链干净地走一遍（含其他监听者与适配器选择）
       return ctx.llm.stream(clone);
     } catch (error) {
       ctx.logger.warn(`cross-model-bridge: transform failed, passing through unchanged: ${String(error)}`);
       return next();
     }
+  });
+
+  // ── 页面数据通道：GET /plugins/dsh-cross-model-bridge/events ──
+  ctx.inject(['webServer'], (sub) => {
+    const ws = sub.get('webServer');
+    if (!ws) return;
+    const send = (res, code, body) => {
+      res.writeHead(code, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      res.end(JSON.stringify(body));
+    };
+    const dispose = ws.register({
+      kind: 'exact',
+      path: '/plugins/dsh-cross-model-bridge/events',
+      handler: async (req, res) => {
+        const method = req.method || 'GET';
+        if (method !== 'GET') return send(res, 405, { error: 'GET only' });
+
+        let reqSessionId = null;
+        try {
+          const url = new URL(req.url, 'http://localhost');
+          reqSessionId = url.searchParams.get('sessionId');
+        } catch (e) {}
+
+        const allList = events.list();
+        const filteredList = reqSessionId
+          ? allList.filter((e) => e.sessionId === reqSessionId)
+          : allList;
+
+        return send(res, 200, {
+          enabled: config.enabled === true,
+          version: '1.2.0',
+          keepThinkingTurns: config.keepThinkingTurns,
+          maxThinkingLength: config.maxThinkingLength,
+          lang: config.lang,
+          events: filteredList,
+          totalEvents: allList.length,
+          sessionId: reqSessionId,
+        });
+      },
+    });
+    return () => {
+      try { if (typeof dispose === 'function') dispose(); } catch { /* ignore */ }
+    };
   });
 }

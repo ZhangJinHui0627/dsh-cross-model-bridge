@@ -1,12 +1,13 @@
 {
   "name": "dsh-cross-model-bridge",
-  "version": "1.0.2",
-  "description": "DSH 跨模型思考桥：切换模型时把上一模型的 reasoning 块降级为正文文本标签，避免思考被静默丢弃，保持推演接力；含滑动窗口与共享记忆注入。",
+  "version": "1.1.0",
+  "description": "DSH 跨模型思考桥：切换模型时把上一模型的 reasoning 块降级为正文标签（推演接力、防静默丢弃）；含右侧栏实时桥接记录页。",
   "type": "module",
   "license": "MIT",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
@@ -23,11 +24,21 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "slots"
+      ]
     }
   },
   "files": [
     "index.js",
+    "client.js",
     "cordis.patch.yml",
+    "install-profile.ps1",
+    "install.cmd",
     "README.md",
     "package.json",
     "LICENSE"
