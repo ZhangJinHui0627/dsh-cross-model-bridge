@@ -36,9 +36,14 @@ function cloneOptions(options) {
   return clone;
 }
 
-export function apply(ctx, userConfig = {}) {
+/**
+ * @param {object} ctx Cordis 上下文
+ * @param {object} [userConfig] 插件配置
+ * @param {{ storageFile?: string }} [deps] 仅供测试 / 嵌入场景覆盖事件持久化路径
+ */
+export function apply(ctx, userConfig = {}, { storageFile = STORAGE_FILE } = {}) {
   const config = normalizeConfig(userConfig);
-  const events = createEventLog(STORAGE_FILE);
+  const events = createEventLog(storageFile);
 
   // 严格契约：使用 async function* 异步生成器，确保下游消费到合法的 AsyncIterable
   ctx.on('llm/stream', async function* (options, next) {
@@ -64,9 +69,11 @@ export function apply(ctx, userConfig = {}) {
     clone.messages = prepared.messages;
     HANDLED.add(clone);
 
-    ctx.logger.info(
-      `cross-model-bridge: [${prepared.stats.mode}] injecting handoff (${prepared.stats.fromModel} -> ${targetModel}) with ${prepared.stats.estimatedTokens} tokens for session ${sessionId || 'none'}`,
-    );
+    if (prepared.injected) {
+      ctx.logger.info(
+        `cross-model-bridge: [${prepared.stats.mode}] injecting handoff (${prepared.stats.fromModel} -> ${targetModel}) with ${prepared.stats.estimatedTokens} tokens for session ${sessionId || 'none'}`,
+      );
+    }
 
     let stream;
     try {
@@ -76,18 +83,19 @@ export function apply(ctx, userConfig = {}) {
       return yield* next();
     }
 
-    // 阶段二（commitResponse）：在流式安全返回并被消费时才提交事件，防状态污染
-    let streamFailed = false;
+    // 阶段二（commitResponse）：仅在流完整结束后才提交事件，防状态污染。
+    // 调用方中途 return()（如用户点"停止"）不会进入 catch，所以不能靠"没报错"判断，必须显式标记完成。
+    let completed = false;
     try {
       for await (const chunk of stream) {
         yield chunk;
       }
+      completed = true;
     } catch (streamErr) {
-      streamFailed = true;
       ctx.logger.warn(`cross-model-bridge: stream transmission error: ${String(streamErr)}`);
       throw streamErr;
     } finally {
-      if (!streamFailed) {
+      if (completed && prepared.injected) {
         events.push({
           time: new Date().toISOString(),
           sessionId,

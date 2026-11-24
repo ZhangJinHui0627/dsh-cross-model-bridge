@@ -1,7 +1,7 @@
 # dsh-cross-model-bridge
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.0-blue?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/version-2.1.1-blue?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen?style=flat-square" alt="Node.js" />
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20DSH%20Desktop-lightgrey?style=flat-square" alt="Platform" />
@@ -9,7 +9,7 @@
 
 > **Seamless Cross-Model & Multi-Account Thinking Handoff Bridge for DeepSeek Harness (DSH)**
 >
-> DeepSeek Harness 跨模型 / 跨账号智能任务接力桥（v2.1.0 工业级版）—— 在同一个 Agent 会话中切换模型或轮换账号时，自动剥离不兼容的私有签名并安全传递历史思考过程，防止 `400` / `PROVIDER_ERROR` 崩溃与上下文断层。
+> DeepSeek Harness 跨模型 / 跨账号智能任务接力桥（v2.1.1 工业级版）—— 在同一个 Agent 会话中切换模型或轮换账号时，自动剥离不兼容的私有签名并安全传递历史思考过程，防止 `400` / `PROVIDER_ERROR` 崩溃与上下文断层。
 
 ---
 
@@ -50,6 +50,7 @@
 3. **Prompt Cache 友好与防套娃 XML 协议**
    * 仅通过 `<internal_handoff data-dsh-bridge="1" from="..." mode="...">...</internal_handoff>` 注入接力上下文，**绝不改动顶层 `system` / `developer` 消息**。
    * 自动幂等清洗更早轮次的旧 handoff 标签，避免连续切换（A → B → C）产生嵌套套娃。
+   * 接棒块固定挂在切换点之后的第一条 User 消息上，在 `keepThinkingTurns` 个真实用户轮次内位置与内容保持不变（前缀字节稳定）；窗口过后不再注入，但跨路由消息里的私有推理仍持续剥离。仅处理来源路由与目标不同（或来源未知）的 `assistant` 消息，目标模型自己的 thinking / 签名原样保留。
    * 保护 Agent 工具调用链，避免破坏 `tool_use` 与 `tool_result` 的紧邻关系；剥离思考块后若消息变空，自动补入 `(continued)` 兜底防止 400 校验报错。
    * 全面兼容非数组推理字段（支持顶层 `reasoning_content`、`reasoning_details` 与 `type: 'thinking'`）。
 4. **阶段二：规范流式委派与安全提交（`commitResponse`）**
@@ -107,7 +108,7 @@ pwsh -File install-profile.ps1 -Uninstall
 | `tailRatio` | `0.60` | 尾部收敛推演预算占比（中部未用完预算自动回流） |
 | `asciiWeight` | `0.25` | ASCII 字符 Token 估算权重 |
 | `nonAsciiWeight` | `1.0` | 非 ASCII 字符（汉字 / 全角）Token 估算权重 |
-| `keepThinkingTurns` | `1` | 仅对最近 N 轮跨路由 `assistant` 消息注入接棒思考证据 |
+| `keepThinkingTurns` | `1` | 切换后携带接棒块的真实用户轮次数，超出后不再注入（跨路由消息的私有推理仍持续剥离）；`0` 表示永不注入、只做剥离 |
 | `lang` | `'zh'` | 接棒协议提示语言（支持 `'zh'` / `'en'`） |
 
 示例配置片段：

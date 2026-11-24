@@ -7,6 +7,7 @@
  * 4. 非数组推理字段兼容（reasoning_content / reasoning_details）
  * 5. 配置比例归一化与边界安全校验
  * 6. 原子落盘与 FIFO 环形缓冲
+ * 7. 切换后的多轮行为：接棒窗口、稳定挂载点、只剥离跨路由推理
  */
 
 import test from 'node:test';
@@ -178,4 +179,112 @@ test('9. 原子落盘与 FIFO 环形缓冲测试', () => {
   } finally {
     if (fs.existsSync(testStorage)) fs.unlinkSync(testStorage);
   }
+});
+
+// ── 切换后的多轮行为 ──────────────────────────────────────────────
+const ROUTE_A = { kind: 'model', provider: 'pA', model: 'model-A' };
+const ROUTE_B = { kind: 'model', provider: 'pB', model: 'model-B' };
+const TO_B = { provider: 'pB', model: 'model-B' };
+const SYS = { role: 'system', content: 'sys' };
+const userMsg = (text) => ({ role: 'user', content: text });
+const hasHandoff = (m) => JSON.stringify(m.content ?? '').includes('internal_handoff');
+const hasReasoning = (m) =>
+  'reasoning_content' in m ||
+  'thinkingSignature' in m ||
+  (Array.isArray(m.content) && m.content.some((b) => b?.type === 'reasoning' || b?.type === 'thinking'));
+
+test('10. 接棒块固定挂在切换点之后的第一条 user 消息，且仅在 keepThinkingTurns 窗口内注入', () => {
+  const a1 = {
+    role: 'assistant',
+    source: ROUTE_A,
+    content: [{ type: 'reasoning', text: 'A 的推理：必须使用方案X。' }, { type: 'text', text: 'A 的回答' }],
+  };
+  const a2 = { role: 'assistant', source: ROUTE_B, content: [{ type: 'text', text: 'B 的回答' }] };
+  const cfg2 = normalizeConfig({ keepThinkingTurns: 2 });
+
+  // 刚切换到 B 的那次请求
+  const turn2 = prepareHandoff({ ...TO_B, messages: [SYS, userMsg('q1'), a1, userMsg('q2')] }, cfg2);
+  assert.equal(turn2.injected, true);
+  assert.ok(hasHandoff(turn2.messages[3]));
+
+  // B 已回答一次，用户又发了新消息：块仍在原位，不会跟着最新的 user 消息移动
+  const history3 = [SYS, userMsg('q1'), a1, userMsg('q2'), a2, userMsg('q3')];
+  const turn3 = prepareHandoff({ ...TO_B, messages: history3 }, cfg2);
+  assert.equal(turn3.injected, true);
+  assert.ok(hasHandoff(turn3.messages[3]));
+  assert.ok(!hasHandoff(turn3.messages[5]));
+  assert.deepEqual(turn3.messages.slice(0, 4), turn2.messages, '前缀逐字节不变（Prompt Cache 友好）');
+
+  // 默认 keepThinkingTurns = 1：窗口已过，不再注入，但跨路由消息的私有推理仍被剥离
+  const expired = prepareHandoff({ ...TO_B, messages: history3 }, normalizeConfig());
+  assert.equal(expired.shouldHandoff, true);
+  assert.equal(expired.injected, false);
+  assert.ok(!expired.messages.some(hasHandoff));
+  assert.ok(!hasReasoning(expired.messages[2]), '窗口外也必须继续剥离，否则 B 会收到 A 的私有块');
+
+  // keepThinkingTurns = 0：永不注入，只做剥离
+  const never = prepareHandoff(
+    { ...TO_B, messages: [SYS, userMsg('q1'), a1, userMsg('q2')] },
+    normalizeConfig({ keepThinkingTurns: 0 }),
+  );
+  assert.equal(never.injected, false);
+  assert.ok(!hasReasoning(never.messages[2]));
+});
+
+test('11. agent 工具循环内：纯 tool_result 消息不消耗窗口，接棒块位置保持稳定', () => {
+  const first = userMsg('开始');
+  const a1 = {
+    role: 'assistant',
+    source: ROUTE_A,
+    content: [{ type: 'reasoning', text: 'A 决定调用工具。' }, { type: 'tool_use', id: 't1', name: 'f', input: {} }],
+  };
+  const r1 = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] };
+  const a2 = { role: 'assistant', source: ROUTE_B, content: [{ type: 'tool_use', id: 't2', name: 'f', input: {} }] };
+  const r2 = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'ok' }] };
+  const cfg = normalizeConfig(); // keepThinkingTurns = 1
+
+  const step1 = prepareHandoff({ ...TO_B, messages: [SYS, first, a1, r1] }, cfg);
+  const step2 = prepareHandoff({ ...TO_B, messages: [SYS, first, a1, r1, a2, r2] }, cfg);
+
+  assert.equal(step1.injected, true);
+  assert.equal(step1.messages[3].content[0].type, 'tool_result', 'tool_result 仍须排在最前');
+  assert.ok(step1.messages[3].content[1].text.includes('<internal_handoff'));
+  assert.equal(step2.injected, true, '纯 tool_result 不算新的用户轮次，窗口未过期');
+  assert.deepEqual(step2.messages.slice(0, 4), step1.messages, '同一轮内前缀不变');
+  assert.ok(!hasHandoff(step2.messages[5]));
+});
+
+test('12. 仅剥离跨路由（或来源未知）的 assistant 推理，目标模型自己的 thinking/签名原样保留', () => {
+  const own = {
+    role: 'assistant',
+    source: ROUTE_B,
+    thinkingSignature: 'SIG-B',
+    content: [{ type: 'thinking', text: 'B 自己的思考' }, { type: 'text', text: 'B 的回答' }],
+  };
+  const foreign = {
+    role: 'assistant',
+    source: ROUTE_A,
+    thinkingSignature: 'SIG-A',
+    reasoning_content: 'A 的思考',
+    content: [{ type: 'text', text: 'A 的回答' }],
+  };
+  const unknown = {
+    role: 'assistant',
+    thinkingSignature: 'SIG-?',
+    content: [{ type: 'reasoning', text: '来源不明的思考' }, { type: 'text', text: '回答' }],
+  };
+
+  const res = prepareHandoff(
+    {
+      ...TO_B,
+      messages: [userMsg('q1'), own, userMsg('q2'), foreign, userMsg('q3'), unknown, userMsg('q4')],
+    },
+    normalizeConfig({ keepThinkingTurns: 5 }),
+  );
+  const [, ownOut, , foreignOut, , unknownOut] = res.messages;
+
+  assert.equal(ownOut.thinkingSignature, 'SIG-B');
+  assert.equal(ownOut.content[0].type, 'thinking');
+  assert.ok(!hasReasoning(foreignOut));
+  assert.ok(!hasReasoning(unknownOut));
 });
