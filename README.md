@@ -1,174 +1,133 @@
 # dsh-cross-model-bridge
 
-[![version](https://img.shields.io/badge/version-1.2.0-blue)](https://github.com/ZhangJinHui0627/dsh-cross-model-bridge/releases)
+[![version](https://img.shields.io/badge/version-2.0.0-blue)](https://github.com/ZhangJinHui0627/dsh-cross-model-bridge/releases)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20DSH%20Desktop-lightgrey)](#安装--卸载)
 
-**DSH（DeepSeek Harness）跨模型思考桥**：在同一个会话里切换模型时，把上一模型的
-思考（reasoning 块）转写为正文文本标签，让新模型能读到上一模型的推演思路；
-同时剔除注定被适配器丢弃的跨模型 reasoning 块——行为可预期、Token 可控、
-并提供**按会话隔离的可视化桥接记录面板**。
+**DSH（DeepSeek Harness）跨模型 / 跨账号智能任务接力桥**。
+
+专为在 DeepSeek Harness 会话中切换模型或轮换账号设计。通过**出站系统级自感知接棒导航**与**关键推演证据收敛**，彻底解决原生切换时思考被静默丢弃、多账号切换上下文断层、以及跨模型调用触发 `PROVIDER_ERROR` 流式崩溃的痛点。
+
+---
+
+## 架构演进与核心特性（v2.0.0）
 
 ```text
-模型 A 深度推理 ──切模型──▶ 模型 B 接续回答
-     │                              ▲
-     └─ reasoning 块（签名失效,      │
-        被适配器静默丢弃）      插件转写为正文标签,
-                               B 看得到 A 的完整思路
+【用户对话历史】
+      │
+      ▼
+┌────────────────────────────────────────────────────────┐
+│ dsh-cross-model-bridge 智能接力检测（宿主 Cordis 拦截器）  │
+└────────────────────────────────────────────────────────┘
+      │
+      ├─▶ 场景 A：同模型换账号（Provider 变更，Model 相同）
+      │     └─ 注入【跨账号任务接棒导航】+ 继承决策目标
+      │
+      ├─▶ 场景 B：跨模型切换（Provider 或 Model 变更）
+      │     ├─ 剥离底层私有 reasoning 签名（杜绝 400 与失效崩溃）
+      │     ├─ 截取末尾收敛阶段关键推演证据（限 800 字，节省 75%+ Token）
+      │     └─ 注入【跨模型任务接棒导航】规范接手行为
+      │
+      ▼
+┌────────────────────────────────────────────────────────┐
+│ 接手 AI（GLM / Gemini / Claude / DeepSeek）自感知接棒  │
+│ 零外部额外 AI 调用 · 零额外网络延迟 · 严格 AsyncIterable 流式 │
+└────────────────────────────────────────────────────────┘
 ```
 
-## 特性总览
+- 🤝 **接手 AI 自感知任务接力**：无需额外调用辅助小模型。在出站 Prompt 中向接手 AI 注入系统级导航协议，直接继承工作目标与已确认决策，无缝推进下一轮。
+- 🧠 **关键推演证据收敛**：前序模型若有深度思考，自动舍弃前期漫长发散试错，仅提取末尾最接近最终结论的关键推演（限 800 字），Token 开销骤降 75% 以上；前序未开启深度思考亦能纯任务交接。
+- 🛡️ **严格流式生成器契约**：彻底重构 `llm/stream` 拦截器为规范的 `async function*`，杜绝返回裸 Promise 引发的 `PROVIDER_ERROR`（模型通道暂时不可用）。
+- 🪟 **物理吸顶与视口隔离面板**：右侧栏与会话主视图中，顶部状态栏物理吸顶不随滚轮滚动，提供“一键回顶最新”按键与“当前对话 / 全部对话”范围过滤。
+- 💾 **防丢持久化与 Session 隔离**：记录自动防抖落盘至本地 `.bridge-events.json`（FIFO 上限 500 条），进程重启不丢失、多对话数据互不混杂。
 
-- 🔁 **推演接力**：跨模型切换时，上一模型的思考自动降级为正文标签，新模型零丢失接续；
-- 🛡️ **防 400 崩溃**：剥离各家私有思考字段与失效签名，跨厂商切换不再报非法请求；
-- 🪟 **滑动窗口**：只注入最近 N 轮思考（默认 1），超长思考硬截断，Token 可控；
-- 📊 **可视化面板**：DSH 右侧栏 + 会话主视图双入口，实时查看每次桥接的方向与规模；
-- 💾 **本地持久化**：桥接记录落盘 JSON（FIFO 上限 500 条），重启不丢、不膨胀、不上传；
-- 🧩 **按会话隔离**：每个对话只显示自己的桥接记录，互不混杂；
-- ⚡ **纯本地执行**：零 AI 调用、零额外 Token、亚毫秒级延迟、数据不出本机。
+---
 
 ## 为什么需要它
 
-DSH 的规范消息里，思考是 assistant content 的 `{ type: 'reasoning', text }` 块；
-原厂签名保存在 adapter 私有的 replayState 里，**只在同模型时校验回放**。
-跨模型切换时签名必然失效：
+在 DeepSeek Harness 的原生机制中，深度思考以 assistant content 的 `{ type: 'reasoning', text }` 形式存储，依赖原厂私有签名进行验证：
 
-| 适配器 | 对跨模型思考的处理 |
-|---|---|
-| DeepSeek 官方（`dsh-llm-deepseek`） | 降级为无签名 thinking 块 |
-| pi-ai（`@earendil-works/pi-ai`，千问 openai-completions） | **静默丢弃**，不发送任何字段 |
+| 切换场景 | 原生表现 | 插件解决方式 |
+|---|---|---|
+| **跨模型切换**<br>(如 Gemini → GLM-5.3) | 签名失效，适配器静默丢弃 reasoning 块；下游流式契约不兼容时触发 `PROVIDER_ERROR` | 剥离底层失效签名，注入任务接棒协议与 800 字推演收敛证据，生成器规范流式委派 |
+| **同模型切账号**<br>(额度用尽轮换账号) | 适配器实例不同，思考可能被清空，新账号丢失当前任务目标与代码决策 | 精准识别同模型账号切换，直接继承已确认结论与进度，无需用户重新交代 |
+| **全量思考直接注入** | 上万字发散式思考直接塞入正文，Token 迅速爆炸且容易让新模型复述自嗨 | 仅保留末尾 800 字最终收敛证据，并在协议中严正声明“仅供思路参考，勿向用户复述” |
 
-无论哪种，新模型都看不到上一模型的推演过程。本插件在宿主层把跨模型思考
-降级为正文文本，让推演接力不断线。
+---
 
-## 跨模型的判定规则
+## 判定与接力协议规范
 
-replay 是否有效取决于 **adapter 实例**，而 adapter 按 **provider 路由**注册
-（`LlmRuntime` 只在该 adapter 同时拥有历史 provider 与目标 provider 时才暴露
-replayState）。因此本插件把「provider 或 model 任一不同」都判定为跨模型：
+### 1. 路由识别规则
 
-| 历史来源 | 目标 | 判定 | 处理 |
+| 历史来源 | 当前目标 | 判定分类 | 行为模式 |
 |---|---|---|---|
-| provider A / model X | provider A / model X | 同路由 | 完全不动（保住原生签名 replay） |
-| provider A / model X | provider B / model X | **跨模型** | 转写为正文标签 |
-| provider A / model X | provider A / model Y | **跨模型** | 转写为正文标签 |
-| 无 source 信息 | 任意 | 保守 | 完全不动 |
+| Provider A / Model X | Provider A / Model X | **同路由** | 完全原生直通（保留原生签名） |
+| Provider A / Model X | Provider B / Model X | **跨账号（同模型）** | 注入同模型换账号接棒导航 |
+| Provider A / Model X | Provider Any / Model Y | **跨模型** | 注入跨模型接棒导航 + 800 字关键推演收敛 |
 
-> ⚠️ 只比较 model 会把「同名模型、不同 provider」误判为同模型，导致思考被
-> 适配器静默丢弃——这是 1.0.0 的缺陷，1.0.1 已修复。同一模型挂多个 provider
-> （如千问平台的多账号路由）正是最容易踩中的场景。
-
-## 工作原理（全部走官方公开扩展点，无猴子补丁）
-
-**宿主半（`index.js`）**：
-
-1. 监听 Cordis 瀑布事件 `'llm/stream'`（同官方 `dsh-session-checkpoint-policy` 的模式）；
-2. 检测消息里是否存在"来源路由 ≠ 目标路由"的 reasoning 块；**没有则零开销直通**；
-3. 有则克隆请求（保留 live 的 `AbortSignal`）：
-   - 最近 `keepThinkingTurns` 条跨模型思考 → 转写为正文开头的文本标签；
-   - 更早的跨模型思考 → 仅剔除 reasoning 块（适配器本来也会丢弃）；
-   - 其余消息与块（tool-call、image、text）→ 原样保留；
-4. 用 `ctx.llm.stream(clone)` 重新进入瀑布；WeakSet 标记防递归；
-5. 每次桥接写入内存环形缓冲（200 条）并防抖持久化到本地
-   `.bridge-events.json`（FIFO 上限 500 条，仅元数据：时间、路由、字数，不含消息内容）；
-6. 通过 `GET /plugins/dsh-cross-model-bridge/events` 供页面拉取，支持 `?sessionId=` 过滤。
-
-**浏览器半（`client.js`）**：
-
-1. 注册右侧栏 tab 类型 + 会话主视图（`sidebarRightTabs` / `conversation.view`）双入口；
-2. 页面含吸顶状态卡（版本/开关/窗口/上限）、一键回顶、自动刷新；
-3. 默认只显示**当前会话**的桥接记录，可一键切换"全部对话"；
-4. 重启或刷新 DSH 后记录从本地文件恢复，不丢失。
-
-注入的标签自带"请勿复述本标签"的防模仿提示（pi-ai 官方为此特意使用无标签
-纯文本；本插件保留显式标签以传达"前序思考"信号，附加不复述指令折中）。
-
-注入效果示例：
+### 2. 注入示例
 
 ```markdown
-【前序模型 deepseek-v4.1-flash-1017 的推演思路（供接续参考）】
-（以下为系统注入的历史上下文，仅供接续参考；请在回答中直接使用其结论，不要复述本标签或本段格式。）
-1. 用户核心需求是……
-2. 方案 A 存在……缺陷，因此排除……
-3. 最终决策采用……
+【跨模型任务接棒导航（gemini-3.8-flash → GLM-5.3-Flash）】
+系统提示：检测到当前会话已交接给你承接。前序对话包含了完整的项目上下文与历史产出。
+请接手模型在处理当前最新输入时，遵循以下接棒规范：
+1. 【目标与进度继承】：从前序对话中直接继承当前核心任务目标与工作进度，无需用户重复交代；
+2. 【结论与决策锁定】：严格遵守前文已确认的技术选型、设计决定与代码修改方案，勿重新论证已解决的问题；
+3. 【无缝推进当前轮】：直接在上一轮的实际产出基础上继续推进下一步，保持代码风格与命名的一致性。
+
+【前序关键推演收敛证据（供思路连贯参考，勿向用户复述）】：
+> ……[更早过程性推演已自动收敛省略]
+> 最终设计确认使用独立的 IteratorExample 与 ArrayListExample 示例类，全量编译并比对输出……
 ```
 
-同模型历史**完全不动**——原生签名回放路径不受影响。
+---
 
-## 配置（cordis.patch.yml insert config）
+## 配置说明
 
-| 字段 | 默认 | 说明 |
+在配置文件（或 `cordis.patch.yml`）中支持以下参数：
+
+| 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 总开关 |
-| `keepThinkingTurns` | `1` | 为最近 N 条跨模型 assistant 消息注入思考文本；`0` = 完全不注入（仅剔除 reasoning 块，最省 Token） |
-| `maxThinkingLength` | `3000` | 单条注入的最大字符数，超出截断 |
-| `lang` | `zh` | 标签语言（`zh` / `en`） |
+| `keepThinkingTurns` | `1` | 只为最近 N 轮跨路由 assistant 消息注入接棒协议与推演证据（默认 1） |
+| `maxThinkingLength` | `800` | 关键推演证据收敛的最大字符数（建议 800 字，取末尾收敛部分） |
+| `lang` | `'zh'` | 导航提示语言（`zh` / `en`） |
 
-## 资源与数据保存策略
+---
 
-| 数据 | 保存位置 | 上限 | 生命周期 |
-|---|---|---|---|
-| 桥接事件（页面展示） | 内存环形缓冲 | 200 条 | DSH 进程存活期间 |
-| 桥接事件（持久化） | `$DSH_HOME/dsh-cross-model-bridge/.bridge-events.json` | 500 条（FIFO） | 永久保留，直至被新记录挤出 |
-| 原生会话消息 | DSH 自有存储 | — | 插件**零写入、零污染** |
+## 安装与部署
 
-- 持久化文件只存**元数据**（时间、路由名、消息数、注入字数），不含任何对话正文；
-- 500 条上限下文件体积约 **50~80 KB**，无膨胀风险，重启后自动恢复；
-- 不想落盘可直接删除该文件，插件下次启动会重建。
-
-## 安装 / 卸载
-
-在插件目录下执行：
+本插件直连桌面环境 Profile，在插件根目录下执行：
 
 ```powershell
-pwsh -File install-profile.ps1              # 装进 desktop profile
-pwsh -File install-profile.ps1 -Uninstall   # 卸载
+# 1. 部署安装至 desktop profile
+pwsh -File install-profile.ps1
+
+# 2. 如需卸载
+pwsh -File install-profile.ps1 -Uninstall
 ```
 
-脚本做的事：备份 profile 的 `package.json` → 加 `link:` 依赖 → 追加 `dsh.profile.bundles`
-→ 建 junction 链接 → 写回前校验。装完**完全退出并重开** DSH Desktop 生效。
+> **提示**：安装或升级后，请完全退出 DeepSeek Harness 客户端并重新启动以加载后台插件。在客户端内按 `Ctrl + R` 可即时刷新前端界面。
 
-## 使用与验证
-
-1. 用模型 A（如 `deepseek-v4.1-flash`）问一个需要推理的问题；
-2. 同一会话切到另一个模型（如 `qwen3.8-max` 或 Claude）追问"我上一个问题你是怎么分析的？"；
-3. 预期：新模型能复述 A 的推理思路，且消息正文开头带注入标签；
-4. 打开右侧栏或顶部"跨模型桥"页面：能看到这次桥接的时间、方向（如
-   `← qianwen / deepseek-v4.1 → antigravity / gemini-3.8-flash`）与注入字数；
-   重启 DSH 后记录仍在。
+---
 
 ## 项目结构
 
 ```text
-├── index.js            # 宿主半：llm/stream 瀑布监听 + 消息变换 + 事件持久化 + 数据路由
-├── client.js           # 浏览器半：右侧栏/主视图双入口面板（无构建步骤的 ModuleLoader 包）
+├── index.js            # 宿主半：Cordis 瀑布流拦截器、智能接力检测、生成器流式委派、本地防抖持久化
+├── client.js           # 浏览器半：右侧栏与主视图双入口、物理吸顶状态栏、按 Session 过滤与一键回顶
 ├── cordis.patch.yml    # bundle patch 声明
-├── install-profile.ps1 # 安装/卸载脚本（改写自 dsh-codex-effort-slider）
-├── install.cmd         # Windows 双击入口（自动选择 pwsh/powershell）
-├── package.json        # 含 dsh.client 声明（platform: web）
-├── README.md
-└── LICENSE
+├── install-profile.ps1 # Profile 注册与 Junction 软链接脚本
+├── install.cmd         # Windows 一键执行入口
+├── package.json        # 插件元数据与 DSH Web 声明
+└── README.md           # 技术架构与使用说明
 ```
 
-## 版本历史
+---
 
-| 版本 | 要点 |
-|---|---|
-| 1.2.0 | 可视化桥接面板（右栏 + 主视图）、按会话隔离、本地持久化（500 条 FIFO）、防丢恢复 |
-| 1.0.2 | 注入标签增加"请勿复述"防模仿提示 |
-| 1.0.1 | 跨模型判定改为 provider + model 双比较（修复同名模型跨 provider 静默丢思考） |
-| 1.0.0 | 首版：llm/stream 拦截、思考转写、滑动窗口、Token 截断 |
+## 代码来源与致谢
 
-## 开源参考与致谢
-
-| 内容 | 来源 | 许可 |
-|---|---|---|
-| `'llm/stream'` 瀑布监听模式 | [@deepseek-ai/dsh-session-checkpoint-policy](https://github.com/deepseek-ai)、dsh-session-title | MIT |
-| 消息/块词汇表、冻结语义、`markAgentLoopRequest` | [@deepseek-ai/dsh-llm](https://github.com/deepseek-ai) | MIT |
-| 右侧栏 tab 类型公开注册路径 | `dsh-client-ui-sidebar-right`、`dsh-client-ui-sidebar-documentpreview` | MIT |
-| 适配器跨模型思考降级行为的判定依据 | `dsh-llm-deepseek`、[@earendil-works/pi-ai](https://www.npmjs.com/package/@earendil-works/pi-ai) | MIT |
-| 安装脚本 | dsh-codex-effort-slider `install-profile.ps1` | — |
-
-## 许可
-
-[MIT](LICENSE)
+- 本插件架构基于 [DeepSeek Harness](https://github.com/deepseek-ai) 官方插件体系与 [Cordis](https://cordis.moe) 服务发现框架设计；
+- 参考并借鉴了官方插件 `dsh-session-checkpoint-policy` 的 `llm/stream` 瀑布流式改写模式与 live `AbortSignal` 处理逻辑；
+- 参考并借鉴了 `dsh-codex-effort-slider` 的 Profile Junction 无侵入式链接安装流程；
+- 特别鸣谢开源社区中关于大语言模型跨架构切换、Token 上下文精简与推演接棒方案的讨论与灵感。
