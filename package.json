@@ -1,7 +1,7 @@
 {
   "name": "dsh-cross-model-bridge",
-  "version": "2.0.0",
-  "description": "DSH 跨模型/跨账号智能接力桥：在切换模型或换账号时，由接手 AI 自感知任务接棒协议，并截取前序关键推演收敛证据，彻底防止报错与思考丢弃；含吸顶可视化记录面板。",
+  "version": "2.1.0",
+  "description": "DSH 跨模型/跨账号智能接力桥（v2.1 工业级版）：首+锚点+尾三段式结构化思维抽取、代码块安全保护、Prompt Cache 友好型与防套娃 XML 协议、严格流式生成器与吸顶可视化面板。",
   "type": "module",
   "license": "MIT",
   "main": "./index.js",
@@ -19,6 +19,7 @@
     "deepseek-harness",
     "cross-model",
     "smart-handoff",
+    "prompt-caching",
     "reasoning",
     "thinking"
   ],

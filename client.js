@@ -1,5 +1,5 @@
 /**
- * dsh-cross-model-bridge - browser half (v2.0.0).
+ * dsh-cross-model-bridge - browser half (v2.1.0 工业级重构版).
  *
  * Registers "跨模型桥" as a conversation view & right-Sidebar tab:
  *   1. the view      -> ctx.slots.inject('conversation.view', ...)
@@ -8,8 +8,10 @@
  *   4. the title     -> keyed 'sidebar.right.pane.tab.title' chip
  *
  * Data comes from host GET /plugins/dsh-cross-model-bridge/events(?sessionId=...)
- * Supports per-session isolation, persistent disk history, frozen header,
- * and Smart Handoff (同模型换账号 vs 跨模型切换自感知接棒).
+ * Features:
+ *   - 三段式结构化抽取展示（首部目标 + 决策锚点 + 收敛尾部）；
+ *   - Prompt Cache 友好提示与 Token 预算监控；
+ *   - 物理绝对吸顶状态栏、一键回顶、会话隔离与防丢持久化。
  */
 
 window.__ModuleLoader__.load({
@@ -36,6 +38,7 @@ window.__ModuleLoader__.load({
     }
 
     function fmtChars(n) {
+      if (!n) return "0 字";
       if (n >= 10000) return (n / 1000).toFixed(1) + "k 字";
       return n + " 字";
     }
@@ -81,11 +84,19 @@ window.__ModuleLoader__.load({
             background: "rgba(9, 105, 218, 0.1)", color: "var(--dsw-alias-state-business-primary, #0969da)",
             fontWeight: 500,
           },
-        }, "v" + (state.version || "2.0.0") + " 智能接力"),
-        h("span", null, "窗口 " + String(state.keepThinkingTurns || 1)),
-        h("span", null, "证据上限 " + String(state.maxThinkingLength || 800) + " 字"),
+        }, "v" + (state.version || "2.1.0") + " 三段式智能接力"),
+        h("span", {
+          title: "三段式预算：15% 初始目标 + 25% 关键决策锚点 + 60% 收敛尾部",
+          style: { color: "var(--dsw-alias-label-secondary, #555)" },
+        }, "预算 " + String(state.maxThinkingTokens || 500) + " Token"),
+        h("span", {
+          style: {
+            fontSize: "11px", padding: "1px 5px", borderRadius: "3px",
+            background: "rgba(45, 164, 78, 0.1)", color: "#1a7f37",
+          },
+          title: "不改写顶层 System 消息，100% 保持厂商原生 KV Cache 前缀命中",
+        }, "⚡ KV Cache 保护"),
         h("div", { style: { marginLeft: "auto", display: "inline-flex", gap: "6px", alignItems: "center" } },
-          // 范围切换：当前对话 vs 全部对话
           h("button", {
             type: "button",
             onClick: onToggleScope,
@@ -123,17 +134,25 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** 单条桥接事件行：展示接棒类型徽标、推演证据状态及详细路由。 */
+    /** 单条桥接事件行：展示三段式抽取详情、接棒类型与路由。 */
     function EventRow(ev) {
-      var isAccount = ev.kind === "account" || (ev.tag && ev.tag.indexOf("账号") !== -1);
+      var isAccount = ev.kind === "account" || ev.mode === "cross-account" || (ev.tag && ev.tag.indexOf("账号") !== -1);
       var badgeBg = isAccount ? "rgba(45, 164, 78, 0.12)" : "rgba(9, 105, 218, 0.12)";
       var badgeColor = isAccount ? "#1a7f37" : "#0969da";
       var badgeText = ev.tag || (isAccount ? "【跨账号接棒】" : "【跨模型接棒】");
 
+      var ext = ev.extraction;
+      var extText = "";
+      if (ext && ext.isTruncated) {
+        extText = "🎯 首部 " + ext.headChars + "字 · 📍 锚点 " + ext.anchorCount + "项 · 🏁 尾部 " + ext.tailChars + "字";
+      } else if (ext && !ext.isTruncated) {
+        extText = "✨ 思考未超预算，完整保留 (" + ext.totalTokens + " Token)";
+      }
+
       return h("div", {
         key: ev.time + ev.target + (ev.sessionId || ""),
         style: {
-          padding: "8px 12px", marginBottom: "8px",
+          padding: "9px 12px", marginBottom: "8px",
           borderRadius: "8px",
           background: "var(--dsw-alias-bg-layer-1, rgba(127,127,127,.05))",
           border: "1px solid var(--dsw-alias-border-l1, rgba(127,127,127,.14))",
@@ -157,14 +176,14 @@ window.__ModuleLoader__.load({
                   fontSize: "11px", padding: "1px 5px", borderRadius: "3px",
                   background: "rgba(130, 80, 223, 0.1)", color: "#8250df",
                 },
-                title: "已从前序深度推演中截取最终收敛证据并注入",
-              }, "🧠 含收敛证据")
+                title: "通过三段式结构化抽取提取关键推演与决策锚点",
+              }, "🧠 三段式证据 (" + (ev.estimatedTokens || "~") + " Token)")
             : h("span", {
                 style: {
                   fontSize: "11px", padding: "1px 5px", borderRadius: "3px",
                   background: "rgba(127, 127, 127, 0.1)", color: "var(--dsw-alias-label-tertiary, #888)",
                 },
-                title: "前序未包含深度推演块，直接进行纯任务上下文交接",
+                title: "前序无深度推演块，直接进行纯任务上下文交接",
               }, "📋 纯任务交接"),
           h("span", {
             style: {
@@ -177,9 +196,18 @@ window.__ModuleLoader__.load({
         h("div", { style: { color: "var(--dsw-alias-label-secondary, #666)", marginBottom: "3px" } },
           (ev.sources || []).map(function (s) { return "← 来源: " + s; }).join("　")
         ),
+        extText
+          ? h("div", {
+              style: {
+                fontSize: "11px", color: "var(--dsw-alias-state-business-primary, #0969da)",
+                background: "rgba(9, 105, 218, 0.05)", padding: "2px 6px", borderRadius: "4px",
+                marginBottom: "3px", display: "inline-block",
+              },
+            }, extText)
+          : null,
         h("div", { style: { color: "var(--dsw-alias-label-tertiary, #888)", fontSize: "11px" } },
           "扫描 " + ev.messages + " 条历史 · 注入协议与证据 " + fmtChars(ev.injectedChars)
-          + (ev.strippedMessages > 0 ? " · 清理旧 reasoning 块 " + ev.strippedMessages + " 条" : "")
+          + (ev.strippedMessages > 0 ? " · 剥离旧 reasoning 签名 " + ev.strippedMessages + " 条" : "")
         )
       );
     }
@@ -193,10 +221,9 @@ window.__ModuleLoader__.load({
       var [scopeMode, setScopeMode] = useState("session"); // "session" | "all"
       var [data, setData] = useState({
         enabled: true,
-        version: "2.0.0",
-        mode: "smart-handoff",
-        keepThinkingTurns: 1,
-        maxThinkingLength: 800,
+        version: "2.1.0",
+        mode: "smart-handoff-v2",
+        maxThinkingTokens: 500,
         lang: "zh",
         events: [],
         totalEvents: 0,
@@ -270,7 +297,7 @@ window.__ModuleLoader__.load({
           ),
           h("div", { style: { fontSize: "11px", color: "var(--dsw-alias-label-tertiary, #888)", margin: "6px 2px 0" } },
             (isSession ? "【当前对话】" : "【全部对话】") +
-            " 共 " + events.length + " 次 · 累计注入 " + fmtChars(totalInjected) +
+            " 共 " + events.length + " 次接力 · 累计注入 " + fmtChars(totalInjected) +
             (data.totalEvents && isSession ? "（总计 " + data.totalEvents + " 次，最近 4s 自动刷新）" : "（最近 4s 自动刷新）")
           )
         ),
@@ -291,8 +318,8 @@ window.__ModuleLoader__.load({
                 isSession ? "当前对话暂无跨模型/跨账号接力记录" : "暂无接力记录",
                 h("br", null),
                 isSession
-                  ? "当额度耗尽切换账号，或切换到不同模型时，插件将自动激活智能接棒导航并在此记录。"
-                  : "在会话中进行模型或账号交接后，此处将实时展示接力详情。"
+                  ? "当额度耗尽切换账号，或切换到不同模型时，插件将自动激活三段式智能接棒导航并在此记录。"
+                  : "在会话中进行模型或账号交接后，此处将实时展示结构化接力详情。"
               )
             : events.map(EventRow)
         )

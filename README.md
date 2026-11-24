@@ -1,83 +1,80 @@
 # dsh-cross-model-bridge
 
-[![version](https://img.shields.io/badge/version-2.0.0-blue)](https://github.com/ZhangJinHui0627/dsh-cross-model-bridge/releases)
+[![version](https://img.shields.io/badge/version-2.1.0-blue)](https://github.com/ZhangJinHui0627/dsh-cross-model-bridge/releases)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20DSH%20Desktop-lightgrey)](#安装--卸载)
 
-**DSH（DeepSeek Harness）跨模型 / 跨账号智能任务接力桥**。
+**DSH（DeepSeek Harness）跨模型 / 跨账号智能任务接力桥（v2.1.0 工业级版）**。
 
-专为在 DeepSeek Harness 会话中切换模型或轮换账号设计。通过**出站系统级自感知接棒导航**与**关键推演证据收敛**，彻底解决原生切换时思考被静默丢弃、多账号切换上下文断层、以及跨模型调用触发 `PROVIDER_ERROR` 流式崩溃的痛点。
+专为在 DeepSeek Harness 会话中切换模型或轮换账号设计。通过**三段式结构化思维预算抽取**、**Prompt Cache 友好型 XML 协议**与**两阶段安全提交**，彻底解决原生切换时的思考被静默丢弃、多账号切换目标断层、代码块被生硬腰斩破坏 Markdown、以及跨模型调用触发 `PROVIDER_ERROR` 流式崩溃的痛点。
 
 ---
 
-## 架构演进与核心特性（v2.0.0）
+## 核心架构与设计升级（v2.1.0）
 
 ```text
 【用户对话历史】
       │
       ▼
-┌────────────────────────────────────────────────────────┐
-│ dsh-cross-model-bridge 智能接力检测（宿主 Cordis 拦截器）  │
-└────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ dsh-cross-model-bridge 智能拦截器（Cordis 宿主层 async function*）  │
+└──────────────────────────────────────────────────────────────────┘
       │
-      ├─▶ 场景 A：同模型换账号（Provider 变更，Model 相同）
-      │     └─ 注入【跨账号任务接棒导航】+ 继承决策目标
+      ├─▶ 阶段一：出站判定与三段式结构化思维抽取（prepareRequest）
+      │     ├─ 首部 15%：锁定前序初始核心任务目标与技术约定约束
+      │     ├─ 锚点 25%：正则提炼关键决策信号句（排除/放弃/必须/最终等），带正文去重
+      │     ├─ 尾部 60%：提取末尾关键推演收敛证据，动态预算自动回流
+      │     ├─ 代码块安全围栏保护：绝不把 ``` / ~~~ 从中间腰斩破坏 Markdown
+      │     └─ 语义标点吸附（句末标点 / 换行）+ 中英双语权重估算（ASCII 0.25, 汉字 1.0）
       │
-      ├─▶ 场景 B：跨模型切换（Provider 或 Model 变更）
-      │     ├─ 剥离底层私有 reasoning 签名（杜绝 400 与失效崩溃）
-      │     ├─ 截取末尾收敛阶段关键推演证据（限 800 字，节省 75%+ Token）
-      │     └─ 注入【跨模型任务接棒导航】规范接手行为
+      ├─▶ Prompt Cache 友好型与防套娃 XML 协议构建
+      │     ├─ 绝不碰顶层 system / developer 消息，100% 保持前缀 KV Cache 命中
+      │     ├─ 采用结构化标签：<internal_handoff data-dsh-bridge="1">
+      │     ├─ 幂等清洗历史旧 handoff 块，彻底杜绝 A->B->C 连续切换时的无限套娃
+      │     ├─ 保护 Agent 工具链：避开破坏 tool_use 与 tool_result 的紧邻性
+      │     └─ 空消息 (continued) 兜底：防止剥离思考后变为空消息触发 400 报错
+      │
+      ├─▶ 规范流式生成器委派（yield*）
+      │     └─ 消费各厂商 AsyncIterable 数据块，彻底根治 PROVIDER_ERROR
       │
       ▼
-┌────────────────────────────────────────────────────────┐
-│ 接手 AI（GLM / Gemini / Claude / DeepSeek）自感知接棒  │
-│ 零外部额外 AI 调用 · 零额外网络延迟 · 严格 AsyncIterable 流式 │
-└────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ 阶段二：流式安全响应后提交状态（commitResponse）                      │
+│ 遇到 429 限流 / 超时中断不污染状态，重试依然能无缝接棒 · 隔离落盘     │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-- 🤝 **接手 AI 自感知任务接力**：无需额外调用辅助小模型。在出站 Prompt 中向接手 AI 注入系统级导航协议，直接继承工作目标与已确认决策，无缝推进下一轮。
-- 🧠 **关键推演证据收敛**：前序模型若有深度思考，自动舍弃前期漫长发散试错，仅提取末尾最接近最终结论的关键推演（限 800 字），Token 开销骤降 75% 以上；前序未开启深度思考亦能纯任务交接。
-- 🛡️ **严格流式生成器契约**：彻底重构 `llm/stream` 拦截器为规范的 `async function*`，杜绝返回裸 Promise 引发的 `PROVIDER_ERROR`（模型通道暂时不可用）。
-- 🪟 **物理吸顶与视口隔离面板**：右侧栏与会话主视图中，顶部状态栏物理吸顶不随滚轮滚动，提供“一键回顶最新”按键与“当前对话 / 全部对话”范围过滤。
-- 💾 **防丢持久化与 Session 隔离**：记录自动防抖落盘至本地 `.bridge-events.json`（FIFO 上限 500 条），进程重启不丢失、多对话数据互不混杂。
-
 ---
 
-## 为什么需要它
+## 为什么需要它（核心对比）
 
-在 DeepSeek Harness 的原生机制中，深度思考以 assistant content 的 `{ type: 'reasoning', text }` 形式存储，依赖原厂私有签名进行验证：
-
-| 切换场景 | 原生表现 | 插件解决方式 |
+| 场景问题 | 传统简单截断方案 | v2.1.0 工业级方案 |
 |---|---|---|
-| **跨模型切换**<br>(如 Gemini → GLM-5.3) | 签名失效，适配器静默丢弃 reasoning 块；下游流式契约不兼容时触发 `PROVIDER_ERROR` | 剥离底层失效签名，注入任务接棒协议与 800 字推演收敛证据，生成器规范流式委派 |
-| **同模型切账号**<br>(额度用尽轮换账号) | 适配器实例不同，思考可能被清空，新账号丢失当前任务目标与代码决策 | 精准识别同模型账号切换，直接继承已确认结论与进度，无需用户重新交代 |
-| **全量思考直接注入** | 上万字发散式思考直接塞入正文，Token 迅速爆炸且容易让新模型复述自嗨 | 仅保留末尾 800 字最终收敛证据，并在协议中严正声明“仅供思路参考，勿向用户复述” |
+| **末尾硬截断的信息盲区** | 容易切断在前期排错已排除的死路上，丢失初始目标；容易切在代码块中间留下单数反引号导致 Markdown 渲染错乱。 | **首+锚点+尾三段式**：15% 锁定初始目标，25% 提取关键排错/决策锚点，60% 保留收敛推演；内置代码块完整性边界与标点吸附。 |
+| **Prompt Cache（KV Cache）失效** | 改写顶层 System 消息导致 Anthropic/OpenAI/Gemini/DeepSeek 的 KV Cache 全量失效，首字延迟（TTFT）与费用飙升。 | **缓存友好挂载**：绝对不改动 System 消息，将结构化 `<internal_handoff>` 挂载在最新 User 消息边界，维持极高缓存命中率。 |
+| **多模型连续切换套娃污染** | 用户 A → B → C 轮换，历史消息中残留大量旧 handoff 提示词，越用越臃肿。 | **多跳幂等清洗**：注入新协议前，自动正则清洗历史中所有旧残留块，保持全篇上下文极简干净。 |
+| **Agent 工具调用（Tool Call）报错** | 在 `tool_use` 与 `tool_result` 之间强行插入文本，导致厂商 API 报 400 校验失败。 | **工具调用紧邻保护**：跳过所有 `tool` 角色，挂载在最后一个 `tool_result` 之后；剥离思考导致 assistant 为空时自动补入 `(continued)`。 |
+| **429 限流或超时导致状态错乱** | 出站即提前修改状态，遭遇 429 限流点击重试时被误判为同路由，导致接棒丢失。 | **两阶段安全提交**：出站仅改写不改状态，只有下游流式真正成功完成时才提交状态与落盘。 |
 
 ---
 
-## 判定与接力协议规范
+## 协议与抽取示例
 
-### 1. 路由识别规则
+```xml
+<internal_handoff data-dsh-bridge="1" from="gemini-3.8-flash" mode="cross-model">
+[跨模型接棒导航（gemini-3.8-flash → GLM-5.3-Flash）]
+系统提示：当前会话已交接给你承接。请直接继承前文所有技术决定与既有进度，保持风格一致，切勿向用户复述本段标记。
 
-| 历史来源 | 当前目标 | 判定分类 | 行为模式 |
-|---|---|---|---|
-| Provider A / Model X | Provider A / Model X | **同路由** | 完全原生直通（保留原生签名） |
-| Provider A / Model X | Provider B / Model X | **跨账号（同模型）** | 注入同模型换账号接棒导航 |
-| Provider A / Model X | Provider Any / Model Y | **跨模型** | 注入跨模型接棒导航 + 800 字关键推演收敛 |
+1. 用户核心需求为实现 Java 集合类的示例与对比测试；
 
-### 2. 注入示例
+【关键决策与排错项】
+- 排除在原有单类中混合实现的方案，避免引入不必要的耦合；
+- 决定分别建立独立类 IteratorExample 与 ArrayListExample 并全量编译；
 
-```markdown
-【跨模型任务接棒导航（gemini-3.8-flash → GLM-5.3-Flash）】
-系统提示：检测到当前会话已交接给你承接。前序对话包含了完整的项目上下文与历史产出。
-请接手模型在处理当前最新输入时，遵循以下接棒规范：
-1. 【目标与进度继承】：从前序对话中直接继承当前核心任务目标与工作进度，无需用户重复交代；
-2. 【结论与决策锁定】：严格遵守前文已确认的技术选型、设计决定与代码修改方案，勿重新论证已解决的问题；
-3. 【无缝推进当前轮】：直接在上一轮的实际产出基础上继续推进下一步，保持代码风格与命名的一致性。
+最终确认比对控制台输出与预期屏幕完全一致，继续向下推进。
 
-【前序关键推演收敛证据（供思路连贯参考，勿向用户复述）】：
-> ……[更早过程性推演已自动收敛省略]
-> 最终设计确认使用独立的 IteratorExample 与 ArrayListExample 示例类，全量编译并比对输出……
+Use this as your prior working memory and respond directly to the user.
+</internal_handoff>
 ```
 
 ---
@@ -89,45 +86,34 @@
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 总开关 |
-| `keepThinkingTurns` | `1` | 只为最近 N 轮跨路由 assistant 消息注入接棒协议与推演证据（默认 1） |
-| `maxThinkingLength` | `800` | 关键推演证据收敛的最大字符数（建议 800 字，取末尾收敛部分） |
-| `lang` | `'zh'` | 导航提示语言（`zh` / `en`） |
+| `maxThinkingTokens` | `500` | 思考链三段式抽取的 Token 预算上限（约 500~800 汉字） |
+| `headRatio` | `0.15` | 首部初始目标预算占比（15%） |
+| `midRatio` | `0.25` | 中部决策锚点预算占比（25%） |
+| `tailRatio` | `0.60` | 尾部收敛推演预算占比（60%，中段剩余预算自动回流） |
+| `asciiWeight` | `0.25` | ASCII 字符 Token 权重（0.25） |
+| `nonAsciiWeight` | `1.0` | 非 ASCII 字符（汉字/全角）Token 权重（1.0） |
+| `keepThinkingTurns`| `1` | 为最近 N 轮跨路由 assistant 消息注入思考（默认 1） |
+| `lang` | `'zh'` | 提示语言 |
 
 ---
 
-## 安装与部署
-
-本插件直连桌面环境 Profile，在插件根目录下执行：
+## 安装与生效
 
 ```powershell
-# 1. 部署安装至 desktop profile
+# 部署安装至 desktop profile
 pwsh -File install-profile.ps1
 
-# 2. 如需卸载
+# 如需卸载
 pwsh -File install-profile.ps1 -Uninstall
 ```
 
-> **提示**：安装或升级后，请完全退出 DeepSeek Harness 客户端并重新启动以加载后台插件。在客户端内按 `Ctrl + R` 可即时刷新前端界面。
-
----
-
-## 项目结构
-
-```text
-├── index.js            # 宿主半：Cordis 瀑布流拦截器、智能接力检测、生成器流式委派、本地防抖持久化
-├── client.js           # 浏览器半：右侧栏与主视图双入口、物理吸顶状态栏、按 Session 过滤与一键回顶
-├── cordis.patch.yml    # bundle patch 声明
-├── install-profile.ps1 # Profile 注册与 Junction 软链接脚本
-├── install.cmd         # Windows 一键执行入口
-├── package.json        # 插件元数据与 DSH Web 声明
-└── README.md           # 技术架构与使用说明
-```
+- **前端热更新**：在 DeepSeek Harness 窗口中按 **`Ctrl + R`** 即可即时加载最新面板；
+- **后端生效**：完全退出并重新打开 DeepSeek Harness 客户端即可加载全新流式拦截器。
 
 ---
 
 ## 代码来源与致谢
 
-- 本插件架构基于 [DeepSeek Harness](https://github.com/deepseek-ai) 官方插件体系与 [Cordis](https://cordis.moe) 服务发现框架设计；
-- 参考并借鉴了官方插件 `dsh-session-checkpoint-policy` 的 `llm/stream` 瀑布流式改写模式与 live `AbortSignal` 处理逻辑；
-- 参考并借鉴了 `dsh-codex-effort-slider` 的 Profile Junction 无侵入式链接安装流程；
-- 特别鸣谢开源社区中关于大语言模型跨架构切换、Token 上下文精简与推演接棒方案的讨论与灵感。
+- 本插件基于 [DeepSeek Harness](https://github.com/deepseek-ai) 官方插件体系与 [Cordis](https://cordis.moe) 服务发现框架；
+- 特别鸣谢《**DeepSeek Harness 跨模型插件客观评价**》（含 30 页深度分析与参考代码）对本插件提出的中肯评测、三段式结构化思维抽取算法（首+锚点+尾）、Prompt Cache 保护思路与防套娃清洗机制；
+- 参考并借鉴了官方插件 `dsh-session-checkpoint-policy` 的流式拦截改写模式与 `dsh-codex-effort-slider` 的无侵入式 Junction 部署方式。
