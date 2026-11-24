@@ -1,0 +1,14 @@
+{
+  "name": "dsh-cross-model-bridge-remotion",
+  "version": "1.0.0",
+  "description": "Remotion animation source for dsh-cross-model-bridge preview GIF",
+  "scripts": {
+    "start": "remotion preview",
+    "build": "remotion render CrossModelDemo out/preview.gif"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remotion": "^4.0.0"
+  }
+}

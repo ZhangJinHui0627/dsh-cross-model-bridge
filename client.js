@@ -255,7 +255,10 @@ window.__ModuleLoader__.load({
       useEffect(function () {
         fetchEvents();
         scrollToTop(false);
-        var timer = setInterval(fetchEvents, POLL_MS);
+        var timer = setInterval(function () {
+          if (typeof document !== "undefined" && document.hidden) return;
+          fetchEvents();
+        }, POLL_MS);
         return function () { clearInterval(timer); };
       }, [fetchEvents, scrollToTop]);
 

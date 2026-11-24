@@ -11,6 +11,9 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
+  "scripts": {
+    "test": "node --test tests/bridge.test.mjs"
+  },
   "engines": {
     "node": ">=22"
   },
@@ -38,6 +41,7 @@
   "files": [
     "index.js",
     "client.js",
+    "lib",
     "cordis.patch.yml",
     "install-profile.ps1",
     "install.cmd",
